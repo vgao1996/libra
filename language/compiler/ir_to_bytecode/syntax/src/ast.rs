@@ -122,6 +122,8 @@ pub struct StructDefinition {
     pub is_nominal_resource: bool,
     /// Human-readable name for the struct that also serves as a nominal type
     pub name: StructName,
+    /// Kind constraints of the type parameters
+    pub kind_constraints: KindConstraints,
     /// the fields each instance has
     pub fields: StructDefinitionFields,
 }
@@ -143,6 +145,21 @@ pub enum StructDefinitionFields {
 #[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Clone)]
 pub struct FunctionName(String);
 
+/// The kind of a type
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum Kind {
+    All,
+    Resource,
+    Unrestricted,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct KindConstraint(pub String, pub Kind);
+
+/// A list of kind constraints
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct KindConstraints(pub Vec<KindConstraint>);
+
 /// The signature of a function
 #[derive(PartialEq, Debug, Clone)]
 pub struct FunctionSignature {
@@ -150,6 +167,8 @@ pub struct FunctionSignature {
     pub formals: Vec<(Var, Type)>,
     /// Optional return types
     pub return_type: Vec<Type>,
+    /// Kind constraints of the type parameters
+    pub kind_constraints: KindConstraints,
 }
 
 /// Public or internal modifier for a procedure
@@ -224,9 +243,11 @@ pub enum Type {
     /// `string`, currently unused
     String,
     /// A module defined struct
-    Struct(QualifiedStructIdent),
+    Struct(QualifiedStructIdent, Vec<Type>),
     /// A reference type, the bool flag indicates whether the reference is mutable
     Reference(bool, Box<Type>),
+    /// A type parameter
+    TypeParameter(String),
 }
 //**************************************************************************************************
 // Statements
@@ -246,10 +267,10 @@ pub enum Builtin {
     Release,
     /// Check if there is a struct object (`StructName` resolved by current module) associated with
     /// the given address
-    Exists(StructName),
+    Exists(StructName, Vec<Type>),
     /// Get the struct object (`StructName` resolved by current module) associated with the given
     /// address
-    BorrowGlobal(StructName),
+    BorrowGlobal(StructName, Vec<Type>),
     /// Returns the height of the current transaction.
     GetHeight,
     /// Returns the price per gas unit the current transaction is willing to pay
@@ -271,9 +292,9 @@ pub enum Builtin {
     /// Initialize a previously empty address by publishing a resource of type Account
     CreateAccount,
     /// Remove a resource of the given type from the account with the given address
-    MoveFrom(StructName),
+    MoveFrom(StructName, Vec<Type>),
     /// Publish an instantiated struct object into sender's account.
-    MoveToSender(StructName),
+    MoveToSender(StructName, Vec<Type>),
 
     /// Convert a mutable reference into an immutable one
     Freeze,
@@ -288,6 +309,7 @@ pub enum FunctionCall {
     ModuleFunctionCall {
         module: ModuleName,
         name: FunctionName,
+        type_parameters: Vec<Type>,
     },
 }
 /// The type for a function call and its location
@@ -299,7 +321,7 @@ pub enum Cmd {
     /// `x = e`
     Assign(Vec<Var_>, Exp_),
     /// `n { f_1: x_1, ... , f_j: x_j  } = e`
-    Unpack(StructName, Fields<Var_>, Exp_),
+    Unpack(StructName, Vec<Type>, Fields<Var_>, Exp_),
     /// `*e_1 = e_2`
     Mutate(Exp_, Exp_),
     /// `abort e`
@@ -455,7 +477,7 @@ pub enum Exp {
     /// Returns a fresh `StructInstance` whose type and kind (resource or otherwise)
     /// as the current struct class (i.e., the class of the method we're currently executing).
     /// `n { f_1: e_1, ... , f_j: e_j }`
-    Pack(StructName, ExpFields),
+    Pack(StructName, Vec<Type>, ExpFields),
     /// `&e.f`, `&mut e.f`
     Borrow {
         /// mutable or not
@@ -603,10 +625,22 @@ impl ModuleDefinition {
     }
 }
 
+impl KindConstraint {
+    pub fn new(s: String, k: Kind) -> Self {
+        KindConstraint(s, k)
+    }
+}
+
+impl KindConstraints {
+    pub fn new(constraints: Vec<KindConstraint>) -> Self {
+        KindConstraints(constraints)
+    }
+}
+
 impl Type {
     /// Creates a new struct type
-    pub fn r#struct(ident: QualifiedStructIdent) -> Type {
-        Type::Struct(ident)
+    pub fn r#struct(ident: QualifiedStructIdent, type_parameters: Vec<Type>) -> Type {
+        Type::Struct(ident, type_parameters)
     }
 
     /// Creates a new reference type from its mutability and underlying type
@@ -692,10 +726,11 @@ impl StructDefinition {
     /// types
     /// Does not verify the correctness of any internal properties, e.g. doesn't check that the
     /// fields do not have reference types
-    pub fn move_declared(is_nominal_resource: bool, name: String, fields: Fields<Type>) -> Self {
+    pub fn move_declared(is_nominal_resource: bool, name: String, kind_constraints: KindConstraints, fields: Fields<Type>) -> Self {
         StructDefinition {
             is_nominal_resource,
             name: StructName::new(name),
+            kind_constraints,
             fields: StructDefinitionFields::Move { fields },
         }
     }
@@ -703,10 +738,11 @@ impl StructDefinition {
     /// Creates a new StructDefinition from the resource kind (true if resource), the string
     /// representation of the name, and the user specified fields, a map from their names to their
     /// types
-    pub fn native(is_nominal_resource: bool, name: String) -> Self {
+    pub fn native(is_nominal_resource: bool, name: String, kind_constraints: KindConstraints) -> Self {
         StructDefinition {
             is_nominal_resource,
             name: StructName::new(name),
+            kind_constraints,
             fields: StructDefinitionFields::Native,
         }
     }
@@ -731,10 +767,11 @@ impl FunctionName {
 
 impl FunctionSignature {
     /// Creates a new function signature from the parameters and the return types
-    pub fn new(formals: Vec<(Var, Type)>, return_type: Vec<Type>) -> Self {
+    pub fn new(formals: Vec<(Var, Type)>, return_type: Vec<Type>, kind_constraints: KindConstraints) -> Self {
         FunctionSignature {
             formals,
             return_type,
+            kind_constraints,
         }
     }
 }
@@ -746,10 +783,11 @@ impl Function {
         visibility: FunctionVisibility,
         formals: Vec<(Var, Type)>,
         return_type: Vec<Type>,
+        kind_constraints: KindConstraints,
         annotations: Vec<FunctionAnnotation>,
         body: FunctionBody,
     ) -> Self {
-        let signature = FunctionSignature::new(formals, return_type);
+        let signature = FunctionSignature::new(formals, return_type, kind_constraints);
         Function {
             visibility,
             signature,
@@ -778,8 +816,8 @@ impl Var {
 
 impl FunctionCall {
     /// Creates a `FunctionCall::ModuleFunctionCall` variant
-    pub fn module_call(module: ModuleName, name: FunctionName) -> Self {
-        FunctionCall::ModuleFunctionCall { module, name }
+    pub fn module_call(module: ModuleName, name: FunctionName, type_parameters: Vec<Type>) -> Self {
+        FunctionCall::ModuleFunctionCall { module, name, type_parameters }
     }
 
     /// Creates a `FunctionCall::Builtin` variant with no location information
@@ -880,8 +918,8 @@ impl Exp {
     }
 
     /// Creates a new pack/struct-instantiation `Exp` with no location information
-    pub fn instantiate(n: StructName, s: ExpFields) -> Exp_ {
-        Spanned::no_loc(Exp::Pack(n, s))
+    pub fn instantiate(n: StructName, tys: Vec<Type>, s: ExpFields) -> Exp_ {
+        Spanned::no_loc(Exp::Pack(n, tys, s))
     }
 
     /// Creates a new binary operator `Exp` with no location information
@@ -1016,6 +1054,36 @@ impl fmt::Display for QualifiedModuleIdent {
     }
 }
 
+impl fmt::Display for KindConstraint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (&self.0, &self.1) {
+            (s, Kind::All) => write!(f, "{}", s),
+            (s, Kind::Resource) => write!(f, "{}: resource", s),
+            (s, Kind::Unrestricted) => write!(f, "{}: unrestricted", s),
+        }
+    }
+}
+
+impl fmt::Display for KindConstraints {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.is_empty() {
+            Ok(())
+        }
+        else {
+            write!(f, "<")?;
+            for (i, c) in self.0.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{}", c)?;
+            }
+            write!(f, ">")
+        }
+    }
+}
+
+
+
 impl fmt::Display for ModuleDefinition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Module({}, ", self.name.name())?;
@@ -1033,7 +1101,7 @@ impl fmt::Display for ModuleDefinition {
 
 impl fmt::Display for StructDefinition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "Struct({}, ", self.name)?;
+        writeln!(f, "Struct({}{}, ", self.name, self.kind_constraints)?;
         match &self.fields {
             StructDefinitionFields::Move { fields } => writeln!(f, "{}", format_fields(fields))?,
             StructDefinitionFields::Native => writeln!(f, "{{native}}")?,
@@ -1091,6 +1159,7 @@ fn format_fields<T: fmt::Display>(fields: &Fields<T>) -> String {
 
 impl fmt::Display for FunctionSignature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.kind_constraints)?;
         write!(f, "(")?;
         for (v, ty) in self.formals.iter() {
             write!(f, "{}: {}, ", v, ty)?;
@@ -1106,6 +1175,15 @@ impl fmt::Display for QualifiedStructIdent {
     }
 }
 
+fn format_type_parameters(tys: &[Type]) -> String {
+    if tys.is_empty() {
+        "".to_string()
+    }
+    else {
+        format!("<{}>", intersperse(tys, ", "))
+    }
+}
+
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1114,10 +1192,11 @@ impl fmt::Display for Type {
             Type::Address => write!(f, "address"),
             Type::ByteArray => write!(f, "bytearray"),
             Type::String => write!(f, "string"),
-            Type::Struct(ident) => write!(f, "{}", ident),
+            Type::Struct(ident, tys) => write!(f, "{}{}", ident, format_type_parameters(tys)),
             Type::Reference(is_mutable, t) => {
                 write!(f, "&{}{}", if *is_mutable { "mut " } else { "" }, t)
             }
+            Type::TypeParameter(s) => write!(f, "{}", s),
         }
     }
 }
@@ -1134,8 +1213,8 @@ impl fmt::Display for Builtin {
             Builtin::CreateAccount => write!(f, "create_account"),
             Builtin::Release => write!(f, "release"),
             Builtin::EmitEvent => write!(f, "log"),
-            Builtin::Exists(t) => write!(f, "exists<{}>", t),
-            Builtin::BorrowGlobal(t) => write!(f, "borrow_global<{}>", t),
+            Builtin::Exists(t, tys) => write!(f, "exists<{}{}>", t, format_type_parameters(tys)),
+            Builtin::BorrowGlobal(t, tys) => write!(f, "borrow_global<{}{}>", t, format_type_parameters(tys)),
             Builtin::GetHeight => write!(f, "get_height"),
             Builtin::GetTxnMaxGasUnits => write!(f, "get_txn_max_gas_units"),
             Builtin::GetTxnGasUnitPrice => write!(f, "get_txn_gas_unit_price"),
@@ -1143,8 +1222,8 @@ impl fmt::Display for Builtin {
             Builtin::GetTxnSender => write!(f, "get_txn_sender"),
             Builtin::GetTxnSequenceNumber => write!(f, "get_txn_sequence_number"),
             Builtin::GetGasRemaining => write!(f, "get_gas_remaining"),
-            Builtin::MoveFrom(t) => write!(f, "move_from<{}>", t),
-            Builtin::MoveToSender(t) => write!(f, "move_to_sender<{}>", t),
+            Builtin::MoveFrom(t, tys) => write!(f, "move_from<{}{}>", t, format_type_parameters(tys)),
+            Builtin::MoveToSender(t, tys) => write!(f, "move_to_sender<{}{}>", t, format_type_parameters(tys)),
             Builtin::Freeze => write!(f, "freeze"),
         }
     }
@@ -1154,7 +1233,7 @@ impl fmt::Display for FunctionCall {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             FunctionCall::Builtin(fun) => write!(f, "{}", fun),
-            FunctionCall::ModuleFunctionCall { module, name } => write!(f, "{}.{}", module, name),
+            FunctionCall::ModuleFunctionCall { module, name, type_parameters } => write!(f, "{}.{}{}", module, name, format_type_parameters(type_parameters)),
         }
     }
 }
@@ -1169,10 +1248,11 @@ impl fmt::Display for Cmd {
                     write!(f, "{} = ({});", intersperse(var_list, ", "), e)
                 }
             }
-            Cmd::Unpack(n, bindings, e) => write!(
+            Cmd::Unpack(n, tys, bindings, e) => write!(
                 f,
-                "{} {{ {} }} = {}",
+                "{}{} {{ {} }} = {}",
                 n,
+                format_type_parameters(tys),
                 bindings
                     .iter()
                     .fold(String::new(), |acc, (field, var)| format!(
@@ -1313,10 +1393,11 @@ impl fmt::Display for Exp {
             Exp::UnaryExp(o, e) => write!(f, "({}{})", o, e),
             Exp::BinopExp(e1, o, e2) => write!(f, "({} {} {})", o, e1, e2),
             Exp::Value(v) => write!(f, "{}", v),
-            Exp::Pack(n, s) => write!(
+            Exp::Pack(n, tys, s) => write!(
                 f,
-                "{}{{{}}}",
+                "{}{}{{{}}}",
                 n,
+                format_type_parameters(tys),
                 s.iter().fold(String::new(), |acc, (field, op)| format!(
                     "{} {} : {},",
                     acc, field, op,

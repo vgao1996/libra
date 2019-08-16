@@ -5,7 +5,7 @@ use codespan::{ByteIndex, Span};
 use crate::ast::{ModuleDefinition, StructDefinition, Script, Program};
 use crate::ast::{
     FunctionAnnotation, FunctionBody, FunctionVisibility, ImportDefinition, ModuleName,
-    Block, Cmd, CopyableVal, Spanned,
+    Block, Cmd, CopyableVal, Spanned, Kind, KindConstraint, KindConstraints,
     Cmd_, Exp_, Exp, Var,  Var_, FunctionCall,
     FunctionName, Builtin, Statement, IfElse, While, Loop, Type, Field, Fields,
     StructName, QualifiedStructIdent, Function, BinOp, ModuleIdent, QualifiedModuleIdent, UnaryOp
@@ -131,12 +131,13 @@ FactorOp: BinOp = {
 
 QualifiedFunctionName : FunctionCall = {
     <f: Builtin> => FunctionCall::Builtin(f),
-    <module_dot_name: DotName> =>  {
+    <module_dot_name: DotName> <type_parameters: TypeParameters> =>  {
         let v: Vec<&str> = module_dot_name.split(".").collect();
         assert!(v.len() == 2, 42);
         FunctionCall::ModuleFunctionCall{
             module: ModuleName::new(v[0].to_string()),
             name: FunctionName::new(v[1].to_string()),
+            type_parameters,
         }
     }
 }
@@ -167,15 +168,15 @@ FieldExp: (Field, Exp_) = {
 }
 
 Term: Exp = {
-
     "move(" <v: Sp<Var>> ")" => Exp::Move(v),
     "copy(" <v: Sp<Var>> ")" => Exp::Copy(v),
     "&mut " <v: Sp<Var>> => Exp::BorrowLocal(true, v),
     "&" <v: Sp<Var>> => Exp::BorrowLocal(false, v),
     Sp<CopyableVal> => Exp::Value(<>),
-    <n: Name> "{" <fs:Comma<FieldExp>> "}" =>
+    <n: Name> <tys: TypeParametersColon> "{" <fs:Comma<FieldExp>> "}" =>
         Exp::Pack(
             StructName::new(n),
+            tys,
             fs.into_iter().collect::<BTreeMap<Field, Exp_>>()
         ),
     "(" <exps: Comma<Sp<Exp>>> ")" => Exp::ExprList(exps),
@@ -203,8 +204,8 @@ ModuleName: ModuleName = {
 Builtin: Builtin = {
     "create_account" => Builtin::CreateAccount,
     "release" => Builtin::Release,
-    "exists<" <t : StructName> ">" => Builtin::Exists(t),
-    "borrow_global<" <t : StructName> ">" => Builtin::BorrowGlobal(t),
+    "exists<" <t : StructName> <tys: TypeParameters> ">" => Builtin::Exists(t, tys),
+    "borrow_global<" <t : StructName> <tys: TypeParameters> ">" => Builtin::BorrowGlobal(t, tys),
     "get_height" => Builtin::GetHeight,
     "get_txn_gas_unit_price" => Builtin::GetTxnGasUnitPrice,
     "get_txn_max_gas_units" => Builtin::GetTxnMaxGasUnits,
@@ -212,8 +213,8 @@ Builtin: Builtin = {
     "get_txn_sender" => Builtin::GetTxnSender,
     "get_txn_sequence_number" => Builtin::GetTxnSequenceNumber,
     "emit_event" => Builtin::EmitEvent,
-    "move_from<" <t: StructName> ">" => Builtin::MoveFrom(t),
-    "move_to_sender<" <t: StructName> ">" => Builtin::MoveToSender(t),
+    "move_from<" <t: StructName> <tys: TypeParameters> ">" => Builtin::MoveFrom(t, tys),
+    "move_to_sender<" <t: StructName> <tys: TypeParameters> ">" => Builtin::MoveToSender(t, tys),
     "get_gas_remaining" => Builtin::GetGasRemaining,
     "freeze" => Builtin::Freeze,
 }
@@ -236,9 +237,10 @@ FieldBindings: (Field, Var_) = {
 pub Cmd : Cmd = {
     <bindings: ReturnBindings> "=" <e: Sp<Exp>> => Cmd::Assign(bindings, e),
     "*" <e: Sp<Exp>> "=" <op: Sp<Exp>> => Cmd::Mutate(e, op),
-    <n: StructName> "{" <bindings: Comma<FieldBindings>> "}" "=" <e: Sp<Exp>> =>
+    <n: StructName> <tys: TypeParameters> "{" <bindings: Comma<FieldBindings>> "}" "=" <e: Sp<Exp>> =>
         Cmd::Unpack(
             n,
+            tys,
             bindings.into_iter().collect(),
             e,
         ),
@@ -343,12 +345,58 @@ FunctionBlock: (Vec<(Var_, Type)>, Block) = {
     "{" <locals: Declarations> <stmts: Statements> "}" => (locals, Block::new(stmts))
 }
 
+KindConstraint: KindConstraint = {
+    <n: Name> => KindConstraint::new(n, Kind::All),
+    <n: Name> ":" "all" => KindConstraint::new(n, Kind::All),
+    <n: Name> ":" "resource" => KindConstraint::new(n, Kind::Resource),
+    <n: Name> ":" "unrestricted" => KindConstraint::new(n, Kind::Unrestricted),
+}
+
+KindConstraintsImpl: KindConstraints = {
+    "<" <constraints: Comma<KindConstraint>> ">" => KindConstraints::new(constraints)
+}
+
+KindConstraints: KindConstraints = {
+    <constraints: KindConstraintsImpl?> => {
+        match constraints {
+            Some(constraints) => constraints,
+            None => KindConstraints::new(vec![]),
+        }
+    }
+}
+
+TypeParametersImpl: Vec<Type> = {
+    "<" <tys: Comma<Type>> ">" => tys
+}
+
+TypeParametersColonImpl: Vec<Type> = {
+    "::" <tys: TypeParametersImpl> => tys
+}
+
+TypeParameters: Vec<Type> = {
+    <tys: TypeParametersImpl?> => {
+        match tys {
+            Some(tys) => tys,
+            None => vec![],
+        }
+    }
+}
+
+TypeParametersColon: Vec<Type> = {
+    <tys: TypeParametersColonImpl?> => {
+        match tys {
+            Some(tys) => tys,
+            None => vec![],
+        }
+    }
+}
+
 Type: Type = {
     "address" => Type::Address,
     "u64" => Type::U64,
     "bool" => Type::Bool,
     "bytearray" => Type::ByteArray,
-    <s: QualifiedStructIdent> => Type::Struct(s),
+    <s: QualifiedStructIdent> <tys: TypeParameters> => Type::Struct(s, tys),
     "&" <t: Type> => Type::Reference(false, Box::new(t)),
     "&mut " <t: Type> => Type::Reference(true, Box::new(t)),
 }
@@ -384,7 +432,7 @@ FunctionDecl : (FunctionName, Function) = {
 }
 
 MoveFunctionDecl : (FunctionName, Function) = {
-    <p: Public?> <n: Name> "(" <args: (ArgDecl)*> ")" <ret: ReturnType?>
+    <p: Public?> <n: Name> <k: KindConstraints> "(" <args: (ArgDecl)*> ")" <ret: ReturnType?>
     <annotations: (FunctionAnnotation)*>
     <locals_body: FunctionBlock> => {
         let (locals, body) = locals_body;
@@ -392,6 +440,7 @@ MoveFunctionDecl : (FunctionName, Function) = {
             if p.is_some() { FunctionVisibility::Public } else { FunctionVisibility::Internal },
             args,
             ret.unwrap_or(vec![]),
+            k,
             annotations,
             FunctionBody::Move{locals: locals, code: body},
         ))
@@ -399,11 +448,12 @@ MoveFunctionDecl : (FunctionName, Function) = {
 }
 
 NativeFunctionDecl: (FunctionName, Function) = {
-    <nat: NativeTag> <p: Public?> <n: Name> "(" <args: (ArgDecl)*> ")" <ret: ReturnType?> ";" => {
+    <nat: NativeTag> <p: Public?> <n: Name> <k: KindConstraints> "(" <args: (ArgDecl)*> ")" <ret: ReturnType?> ";" => {
         (FunctionName::new(n), Function::new(
             if p.is_some() { FunctionVisibility::Public } else { FunctionVisibility::Internal },
             args,
             ret.unwrap_or(vec![]),
+            k,
             vec![],
             FunctionBody::Native,
         ))
@@ -443,6 +493,7 @@ pub Program : Program = {
 	        FunctionVisibility::Public,
                 vec![],
                 vec![],
+                KindConstraints::new(vec![]),
                 vec![],
                 FunctionBody::Move {
                     locals: vec![],
@@ -462,6 +513,7 @@ pub Script : Script = {
                 FunctionVisibility::Public,
                 args,
                 vec![],
+                KindConstraints::new(vec![]),
                 vec![],
                 FunctionBody::Move{ locals: locals, code: body },
             );
@@ -470,15 +522,15 @@ pub Script : Script = {
 }
 
 StructDecl: StructDefinition = {
-    <is_nominal_resource: StructKind> <n: Name> "{" <data: (FieldDecl)*> "}" => {
+    <is_nominal_resource: StructKind> <n: Name> <k: KindConstraints> "{" <data: (FieldDecl)*> "}" => {
         let mut fields = Fields::new();
         for (field, type_) in data.into_iter() {
             fields.insert(field, type_);
         }
-        StructDefinition::move_declared(is_nominal_resource, n, fields)
+        StructDefinition::move_declared(is_nominal_resource, n, k, fields)
     },
-    <native: NativeTag> <is_nominal_resource: StructKind> <n: Name> ";" =>
-        StructDefinition::native(is_nominal_resource, n),
+    <native: NativeTag> <is_nominal_resource: StructKind> <n: Name> <k: KindConstraints> ";" =>
+        StructDefinition::native(is_nominal_resource, n, k),
 }
 
 QualifiedModuleIdent: QualifiedModuleIdent = {
