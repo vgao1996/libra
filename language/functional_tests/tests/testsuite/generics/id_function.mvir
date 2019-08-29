@@ -1,0 +1,5 @@
+module M {
+    public id<T>(x: T): T {
+        return move(x);
+    }
+}

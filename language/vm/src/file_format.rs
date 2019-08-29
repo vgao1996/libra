@@ -29,7 +29,7 @@
 use crate::{
     access::ModuleAccess,
     check_bounds::BoundsChecker,
-    errors::{VMInvariantViolation, VerificationError},
+    errors::{VMInvariantViolation, VMStaticViolation, VerificationError},
     internals::ModuleIndex,
     IndexKind, SignatureTokenKind,
 };
@@ -448,6 +448,19 @@ pub enum Kind {
     Unrestricted,
 }
 
+impl Kind {
+    /// Checks if the given kind is a sub-kind of another.
+    #[inline]
+    pub fn is_sub_kind_of(self, k: Kind) -> bool {
+        use Kind::*;
+
+        match (self, k) {
+            (_, All) | (Resource, Resource) | (Unrestricted, Unrestricted) => true,
+            _ => false,
+        }
+    }
+}
+
 /// A `SignatureToken` is a type declaration for a location.
 ///
 /// Any location in the system has a TypeSignature.
@@ -636,6 +649,36 @@ impl SignatureToken {
                 "debug_set_sh_idx (to {}) called for non-struct token {:?}",
                 sh_idx, other
             ),
+        }
+    }
+
+    /// Creating a new type by Substituting the type variables with type actuals.
+    pub fn substitute(&self, tys: &[SignatureToken]) -> Result<SignatureToken, VMStaticViolation> {
+        use SignatureToken::*;
+
+        match self {
+            Bool => Ok(Bool),
+            U64 => Ok(U64),
+            String => Ok(String),
+            ByteArray => Ok(ByteArray),
+            Address => Ok(Address),
+            Struct(idx, actuals) => Ok(Struct(
+                *idx,
+                actuals
+                    .iter()
+                    .map(|ty| ty.substitute(tys))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )),
+            Reference(ty) => Ok(Reference(Box::new(ty.substitute(tys)?))),
+            MutableReference(ty) => Ok(MutableReference(Box::new(ty.substitute(tys)?))),
+            TypeParameter(idx) => match tys.get(*idx as usize) {
+                Some(ty) => Ok(ty.clone()),
+                None => Err(VMStaticViolation::IndexOutOfBounds(
+                    IndexKind::TypeParameter,
+                    tys.len(),
+                    *idx as usize,
+                )),
+            },
         }
     }
 }
@@ -1462,9 +1505,9 @@ impl CompiledModuleMut {
             IndexKind::ByteArrayPool => self.byte_array_pool.len(),
             IndexKind::AddressPool => self.address_pool.len(),
             // XXX these two don't seem to belong here
-            other @ IndexKind::LocalPool | other @ IndexKind::CodeDefinition => {
-                panic!("invalid kind for count: {:?}", other)
-            }
+            other @ IndexKind::LocalPool
+            | other @ IndexKind::CodeDefinition
+            | other @ IndexKind::TypeParameter => panic!("invalid kind for count: {:?}", other),
         }
     }
 

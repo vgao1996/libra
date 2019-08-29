@@ -15,13 +15,14 @@ use std::iter::DoubleEndedIterator;
 
 use crate::{
     access::ModuleAccess,
+    errors::VMStaticViolation,
     file_format::{
         CodeUnit, CompiledModule, FieldDefinition, FunctionDefinition, FunctionHandle,
         FunctionSignature, Kind, LocalIndex, LocalsSignature, ModuleHandle, SignatureToken,
         StructDefinition, StructDefinitionIndex, StructFieldInformation, StructHandle,
         StructHandleIndex, TypeSignature,
     },
-    SignatureTokenKind,
+    IndexKind, SignatureTokenKind,
 };
 use std::collections::BTreeSet;
 
@@ -420,13 +421,13 @@ impl<'a, T: ModuleAccess> TypeSignatureView<'a, T> {
     }
 
     #[inline]
-    pub fn kind(&self) -> Kind {
-        self.token().kind()
+    pub fn kind(&self, type_formals: &[Kind]) -> Result<Kind, VMStaticViolation> {
+        self.token().kind(type_formals)
     }
 
     #[inline]
-    pub fn contains_nominal_resource(&self) -> bool {
-        self.token().contains_nominal_resource()
+    pub fn contains_nominal_resource(&self, type_formals: &[Kind]) -> bool {
+        self.token().contains_nominal_resource(type_formals)
     }
 }
 
@@ -531,54 +532,107 @@ impl<'a, T: ModuleAccess> SignatureTokenView<'a, T> {
         self.token.signature_token_kind()
     }
 
-    #[inline]
-    pub fn kind(&self) -> Kind {
+    // TODO: refactor views so that we get the type formals from self.
+    pub fn kind(&self, type_formals: &[Kind]) -> Result<Kind, VMStaticViolation> {
+        use SignatureToken::*;
+
         match self.token {
-            // TODO: Type actuals are ignored, fix it (generics).
-            SignatureToken::Struct(sh_idx, type_arguments) => {
-                let is_nominal_resource = StructHandleView::new(self.module, self.module.struct_handle_at(*sh_idx))
-                    .is_nominal_resource();
-                // Nominal resources are always of kind `Kind::Resource`
-                if is_nominal_resource {
-                    return Kind::Resource
+            // These primitive types have kind unrestricted.
+            Bool | U64 | String | ByteArray | Address => Ok(Kind::Unrestricted),
+
+            // Reference types are unrestricted, but we still need to inspect its internals to
+            // ensure all instantiations satisfy kind constraints.
+            Reference(ty) | MutableReference(ty) => {
+                Self::new(self.module(), ty).kind(type_formals)?;
+                Ok(Kind::Unrestricted)
+            }
+
+            // To get the kind of a type parameter, we lookup its definition in the formals.
+            TypeParameter(idx) => match type_formals.get(*idx as usize) {
+                Some(kind) => Ok(*kind),
+                None => Err(VMStaticViolation::IndexOutOfBounds(
+                    IndexKind::TypeParameter,
+                    type_formals.len(),
+                    *idx as usize,
+                )),
+            },
+
+            Struct(idx, tys) => {
+                // Get the struct handle at idx. Note the index could be out of bounds.
+                let struct_handles = self.module().struct_handles();
+                let sh = struct_handles.get(idx.0 as usize).ok_or_else(|| {
+                    VMStaticViolation::IndexOutOfBounds(
+                        IndexKind::StructHandle,
+                        struct_handles.len(),
+                        idx.0 as usize,
+                    )
+                })?;
+
+                // Recursively verify all the type actuals and check if their kinds satisfy the
+                // constraints of the current struct.
+                let struct_type_formals = &sh.type_formals;
+
+                // Check if the number of formals and the number of actuals match.
+                if struct_type_formals.len() != tys.len() {
+                    return Err(VMStaticViolation::NumberOfTypeActualsMismatch(
+                        struct_type_formals.len(),
+                        tys.len(),
+                    ));
                 }
 
-                // For other structs, their kind is dependent on their type arguments
-                // - If any type argument is `Kind::All`, returns `Kind:All`
-                // - Otherwise if any type argument is `Kind::Resource`, returns `Kind::Resource`
-                // - Otherwise returns `Kind::Unrestricted`
-                type_arguments.iter().map(
-                    |token| Self::new(self.module, token).kind()
-                ).fold(Kind::Unrestricted, |acc_kind, next_kind| {
-                    match (acc_kind, next_kind) {
-                        (Kind::All, _) | (_, Kind::All) => Kind::All,
-                        (Kind::Resource, _) | (_, Kind::Resource) => Kind::Resource,
-                        (Kind::Unrestricted, Kind::Unrestricted) => Kind::Unrestricted
-                    }
-                })
+                // Recursively verify the type actuals and gather their kinds.
+                let kinds = tys
+                    .iter()
+                    .map(|ty| Self::new(self.module(), ty).kind(type_formals))
+                    .collect::<Result<Vec<_>, VMStaticViolation>>()?;
+
+                // Check if each kind is a sub-kind of that specified in the constraint.
+                if kinds
+                    .iter()
+                    .zip(type_formals.iter())
+                    .any(|(k1, k2)| !k1.is_sub_kind_of(*k2))
+                {
+                    return Err(VMStaticViolation::KindMismatch);
+                }
+
+                // At this point all type actuals have been verified.
+                // It is safe to conclude early the struct (instance) is a valid resource if marked
+                // so.
+                if sh.is_nominal_resource {
+                    return Ok(Kind::Resource);
+                }
+
+                // Derive the kind of the struct (instance).
+                //   - If any of the type actuals have kind `all`, then the struct have kind `all`.
+                //     - `all` means part of the type can be either `resource` or `unrestricted`.
+                //     - Therefore it is also impossible to determine the kind of the type as a
+                //       whole, and thus `all`.
+                //   - If none of the type actuals has kind `all`, then the struct is a resource if
+                //     and only if one of the type actuuals has kind `resource`.
+                let kind = kinds
+                    .iter()
+                    .fold(Kind::Unrestricted, |acc_kind, next_kind| {
+                        match (acc_kind, next_kind) {
+                            (Kind::All, _) | (_, Kind::All) => Kind::All,
+                            (Kind::Resource, _) | (_, Kind::Resource) => Kind::Resource,
+                            (Kind::Unrestricted, Kind::Unrestricted) => Kind::Unrestricted,
+                        }
+                    });
+
+                Ok(kind)
             }
-            SignatureToken::Reference(_)
-            | SignatureToken::MutableReference(_)
-            | SignatureToken::Bool
-            | SignatureToken::U64
-            | SignatureToken::String
-            | SignatureToken::ByteArray
-            | SignatureToken::Address => Kind::Unrestricted,
-            // TODO: To get the kind of a type parameter we need to look at the struct/function
-            // that contains it. Change the API or remodel accesses/views with a tiered system.
-            SignatureToken::TypeParameter(_) => panic!("cannot tell if a type parameter is a resource or not (feature not yet implemented)"),
         }
     }
 
-    pub fn contains_nominal_resource(&self) -> bool {
+    // TODO: refactor views so that we get the type formals from self.
+    pub fn contains_nominal_resource(&self, type_formals: &[Kind]) -> bool {
         match self.token {
-            // TODO: Type actuals are ignored, fix it (generics).
             SignatureToken::Struct(sh_idx, type_arguments) => {
                 StructHandleView::new(self.module, self.module.struct_handle_at(*sh_idx))
                     .is_nominal_resource()
-                    || type_arguments
-                        .iter()
-                        .any(|token| Self::new(self.module, token).contains_nominal_resource())
+                    || type_arguments.iter().any(|token| {
+                        Self::new(self.module, token).contains_nominal_resource(type_formals)
+                    })
             }
             SignatureToken::Reference(_)
             | SignatureToken::MutableReference(_)
@@ -586,8 +640,12 @@ impl<'a, T: ModuleAccess> SignatureTokenView<'a, T> {
             | SignatureToken::U64
             | SignatureToken::String
             | SignatureToken::ByteArray
-            | SignatureToken::Address
-            | SignatureToken::TypeParameter(_) => false,
+            | SignatureToken::Address => false,
+
+            SignatureToken::TypeParameter(idx) => match type_formals[*idx as usize] {
+                Kind::Resource => true,
+                Kind::All | Kind::Unrestricted => false,
+            },
         }
     }
 

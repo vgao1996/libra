@@ -75,6 +75,7 @@ impl<'a> CodeUnitVerifier<'a> {
         if !errors.is_empty() {
             return errors;
         }
+        println!("verify fn {}", self.module.name());
         TypeAndMemorySafetyAnalysis::verify(self.module, function_definition, cfg)
     }
 }
