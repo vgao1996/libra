@@ -4271,7 +4271,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "codespan",
- "diem-types",
  "diem-workspace-hack",
  "hex",
  "move-core-types",
